@@ -431,8 +431,9 @@ class NNMCTS:
         my_child = self.root_node.SearchChild(my_action)
 
         self.root_node = my_child.SearchChild(opp_action)
+        self.game_state = GameState(new_board_state, just_decided=3 - self.my_id)
         if self.root_node is None:
-            self.root_node = Node(new_board_state, None, opp_action)
+            self.root_node = Node(self.game_state, None, opp_action)
             if print_info is True:
                 print('Not visited tree. Create new tree.')
         else:
@@ -440,7 +441,6 @@ class NNMCTS:
             if print_info is True:
                 print('Reuse tree. visit_num = %d (mean value = %.4f)' % (
             self.root_node.visit, self.root_node.value / self.root_node.visit))
-        self.game_state = GameState(new_board_state, just_decided=3 - self.my_id)
 
     def ClearQueue(self, print_info = True):
         # 혹시 이전 작업의 잔재가 남아 있으면 제거한다.
@@ -552,14 +552,14 @@ def TrainValueNetwork(network_path, device, replay_buffer, saver_lock):
         # Update network
         train_network.fit()
 
-def ProcSelfPlay(network_path, play_devices, time_out, board_size, replay_buffer, saver_lock):
+def ProcSelfPlay(process_name, network_path, play_devices, time_out, board_size, replay_buffer, saver_lock, self_play_state):
     init_game_board = [[0 for _ in range(board_size)] for _ in range(board_size)]
     init_game_state = GameState(init_game_board)
     game_state = init_game_state.Clone()
     x_player_mcts = NNMCTS(game_state, 1, network_path, play_devices[0], time_out=time_out, proc_num=1, saver_lock=saver_lock)
     o_player_mcts = NNMCTS(game_state, 2, network_path, play_devices[1], time_out=time_out, proc_num=1, saver_lock=saver_lock)
-    print('SelfPlayers ready.')
     played_game = 0
+    print('[%s]Start SelfPlay.'%process_name)
     while True:
         board_state_list = []
         game_state = init_game_state.Clone()
@@ -572,6 +572,7 @@ def ProcSelfPlay(network_path, play_devices, time_out, board_size, replay_buffer
         game_state.DoAction(action)
         board_state_list.append(game_state.board_state)
         is_x_turn = True
+        turn_num = 2
         while (game_state.CheckWin() is False and game_state.draw is False):
             if is_x_turn is True:
                 x_player_mcts.UpdateCurrentState(game_state.board_state, print_info=False)
@@ -584,6 +585,9 @@ def ProcSelfPlay(network_path, play_devices, time_out, board_size, replay_buffer
                 game_state.DoAction(action)
                 is_x_turn = True
             board_state_list.append(game_state.board_state)
+            turn_num +=1
+            self_play_state.value = turn_num
+            # print('[%s] Cur Turn Num=%d'%(process_name, turn_num))
 
         for board_state in board_state_list:
             if game_state.draw is True:
@@ -595,9 +599,11 @@ def ProcSelfPlay(network_path, play_devices, time_out, board_size, replay_buffer
                     target_value = 0.0
             replay_buffer.put((board_state, target_value))
         played_game += 1
-        print('Selfplay Num = %d'%played_game)
+        # print(board_state_list[-1])
+        # print(target_value)
+        print('[%s]Selfplay Num = %d, replay size = %d'%(process_name, played_game, len(board_state_list)))
 
-def ProcEvaluate(time_out, eval_game, saver_lock):
+def ProcEvaluate(time_out, eval_game, saver_lock, eval_proc_state):
     env = gym.make('Gomoku9x9-v0')  # default 'beginner' level opponent policy
 
     eval_result_list = deque(maxlen=eval_game)
@@ -609,16 +615,20 @@ def ProcEvaluate(time_out, eval_game, saver_lock):
     decision_maker = NNMCTS(init_game_state, 1, nn_path, '/cpu:0', time_out=time_out, proc_num=1)
     best_win_rate = 0
     eval_num = 0
+    print('Start Evaluation Process.')
     while True:
         env.reset()
         done = False
         game_state = init_game_state.Clone()
         decision_maker.ResetGameState(game_state)
+        turn_num = 0
         while done is False:
             action, win_rate = decision_maker.SearchBestActionMultiProc(print_info=False)
             observation, reward, done, info = env.step(action)
             if done is False:
                 decision_maker.UpdateCurrentState(observation, print_info=False)
+            turn_num += 1
+            eval_proc_state.value = turn_num
         if reward > 0:
             eval_result_list.append(1.0)
         elif reward < 0:
@@ -645,26 +655,32 @@ def SelfPlayTrain():
     train_device = '/gpu:0'
     play_devices = ['/cpu:0','/cpu:0']
     board_size = 9
-    time_out = 10
+    train_time_out = 3
+    eval_time_out = 10
     eval_game_num = 50
     saver_lock = Lock()
     replay_buffer = Queue()
+
 
     # Start train process, 1 train process
     # train_process = Process(target=TrainValueNetwork, args=(network_path, train_device, replay_buffer, saver_lock,))
     # train_process.start()
 
     # Start Self-play process, at least 4 processes will run
-    selfplay_process = Process(target=ProcSelfPlay, args=(network_path, play_devices, time_out, board_size, replay_buffer, saver_lock,))
+    selfplay_state = Value('i',0)
+    selfplay_process = Process(target=ProcSelfPlay, args=('Proc1', network_path, play_devices, train_time_out, board_size, replay_buffer, saver_lock, selfplay_state,))
     # selfplay_process.run()
     selfplay_process.start()
 
     # Start Evaluation process, 2 processes will run
-    eval_process = Process(target=ProcEvaluate, args=(time_out, eval_game_num, saver_lock, ))
+    eval_proc_state = Value('i', 0)
+    eval_process = Process(target=ProcEvaluate, args=(eval_time_out, eval_game_num, saver_lock, eval_proc_state,))
     # eval_process.run()
     eval_process.start()
 
-    eval_process.join()
+    while True:
+        print('Self_Play Turn Num = %d, Eval Process Turn = %d'%(selfplay_state.value, eval_proc_state.value))
+        time.sleep(3)
 
 def play_mcts_gomoku():
     env = gym.make('Gomoku9x9-v0')  # default 'beginner' level opponent policy
