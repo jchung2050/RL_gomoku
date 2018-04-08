@@ -103,6 +103,7 @@ class Node:
 
     def GetScore(self):
         if self.visit > 0:
+            # return self.visit
             return self.win / self.visit
         else:
             return 0.0
@@ -205,7 +206,7 @@ class MCTS:
             proc.terminate()
         self.proc_list = []
 
-    def UpdateCurrentState(self, new_board_state):
+    def UpdateCurrentState(self, new_board_state, print_info=True):
         # 나와 상대의 Action에 따라 바뀐 현재 Node를 갱신한다.
         prev_state = self.game_state.board_state
         x_action, o_action = GetAction(prev_state, new_board_state)
@@ -217,14 +218,23 @@ class MCTS:
             opp_action = x_action
         my_child = self.root_node.SearchChild(my_action)
 
-        self.root_node = my_child.SearchChild(opp_action)
-        if self.root_node is None:
-            self.root_node = Node(new_board_state, None, opp_action)
-            print('Not visited tree. Create new tree.')
+        if my_child is not None:
+            self.root_node = my_child.SearchChild(opp_action)
+            self.game_state = GameState(new_board_state, just_decided=3 - self.my_id)
+            if self.root_node is None:
+                self.root_node = Node(self.game_state, None, opp_action)
+                if print_info is True:
+                    print('Not visited tree. Create new tree.')
+            else:
+                self.root_node.parent = None
+                if print_info is True:
+                    print('Reuse tree. visit_num = %d (mean value = %.4f)' % (
+                        self.root_node.visit, self.root_node.win / self.root_node.visit))
         else:
-            self.root_node.parent = None
-            print('Reuse tree. visit_num = %d (win_rate = %.4f)' % (self.root_node.visit, self.root_node.win/self.root_node.visit) )
-        self.game_state = GameState(new_board_state, just_decided= 3- self.my_id)
+            self.game_state = GameState(new_board_state, just_decided=3 - self.my_id)
+            self.root_node = Node(self.game_state, None, opp_action)
+            if print_info is True:
+                print('Not visited tree. Create new tree.')
 
     def SearchBestActionMultiProc(self):
         start_time = time.time()
