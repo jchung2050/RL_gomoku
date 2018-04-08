@@ -207,12 +207,14 @@ def GetRolloutProbability(state, candidate_action_list=None):
 
 def ProcPredictValue(nn_path, device, input_queue, output_queue, proc_state, saver_lock, freeze_network):
     # Init neural network
-    value_predictor = GomokuNetwork(nn_path, device=device, saver_lock=saver_lock)
+    value_predictor = GomokuNetwork(nn_path, device=device, saver_lock=saver_lock, owner_name='ValuePredictor')
     print('GomokuNetwork Initialized.')
     while True:
-        if freeze_network is False:
+        if freeze_network.value == 0:
             # Always use the latest network, if this is trainee
+            print('Restore network in ProcPredictValue')
             value_predictor.restore_network()
+            freeze_network.value = 1
         proc_state.value = 0  # Waiting
         state_list = []
         action_list_list = []
@@ -245,7 +247,9 @@ def TransMatToArr(matrix):
     return np.array(matrix).flatten().tolist()
 
 class GomokuNetwork:
-    def __init__(self, network_path=None, replay_buffer_size=2000, board_size=9, lr=0.01, device='/gpu:0', saver_lock=None, train_mode=False):
+    def __init__(self, network_path=None, replay_buffer_size=10000, board_size=9, lr=0.01, device='/gpu:0',
+                 saver_lock=None, train_mode=False, owner_name = ''):
+        self.owner_name = owner_name
         self.board_size = board_size
         self.train_mode = train_mode
         self.saver_lock = saver_lock
@@ -287,6 +291,7 @@ class GomokuNetwork:
         self.save_frequency = 10000
         self.iter_idx = 0
         self.cur_win_rate = 0
+        self.is_restored = False
 
     def load_model(self, network_path, train_mode):
         with self.graph.as_default():
@@ -300,25 +305,27 @@ class GomokuNetwork:
                 self.save_time = os.path.getmtime(network_path + 'model.ckpt.data-00000-of-00001')
                 if train_mode is True:
                     self.create_train_op()
+                self.sess.run(tf.global_variables_initializer())
                 self.saver.restore(self.sess, network_path + 'model.ckpt')
-            self.sess.run(tf.global_variables_initializer())
 
     def restore_network(self):
         try:
             save_time = os.path.getmtime(self.network_path + 'model.ckpt.data-00000-of-00001')
             if save_time > self.save_time:
                 if self.saver_lock is not None:
-                    print('[Read] Lock Saver')
+                    # print('[Read] Lock Saver')
                     self.saver_lock.acquire()
                 self.saver.restore(self.sess, self.network_path + 'model.ckpt')
                 if self.saver_lock is not None:
-                    print('[Read] UnLock Saver')
+                    # print('[Read] UnLock Saver')
                     self.saver_lock.release()
-                print('Model Restored to the latest one.')
+                print('[%s] Model Restored to the latest one.'%self.owner_name)
                 self.save_time = save_time
+            else:
+                print('[%s] No new model.'%self.owner_name)
+            self.is_restored = True
         except FileNotFoundError:
-            pass
-            # print('No Model file to restore.')
+            print('No Model file to restore.')
 
     def build_model(self, train_mode):
         with self.graph.as_default():
@@ -377,7 +384,7 @@ class GomokuNetwork:
                 self.target_action_prob = tf.placeholder(tf.float32, shape=[None, self.board_size * self.board_size])
                 self.value_loss = tf.reduce_mean(((self.target_value - self.predicted_value) ** 2) / 2)
                 self.action_prob_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels= self.target_action_prob, logits= self.predicted_action_out))
-                self.loss = self.value_loss + self.action_prob_loss
+                self.loss = self.value_loss + 0.1 * self.action_prob_loss
                 self.prediction_error = tf.reduce_mean(tf.abs(self.target_value - self.predicted_value))
                 # self.train_op = tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
                 self.train_op = tf.train.AdagradOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
@@ -433,7 +440,8 @@ class GomokuNetwork:
         # -1~+1을 0~1로 변경. 1이면 흑(X,  1)이 승리 0이면 백(O, 2)가 승리
         win_rate_list = []
         for value in predicted_value:
-            win_rate_list.append((value + 1) / 2)
+            win_rate_list.append((value[0] + 1) / 2)
+
         return win_rate_list
 
     def predict_action_prob(self, board_state_list):
@@ -465,7 +473,7 @@ class GomokuNetwork:
             self.cur_lr = self.init_lr
 
         # 학습데이터 준비
-        if len(self.replay_buffer) <= self.replay_buffer_size/4:
+        if len(self.replay_buffer) <= 1000:
             return self.iter_idx
         minibatch = random.sample(
             self.replay_buffer, min(len(self.replay_buffer), self.batch_size))
@@ -512,13 +520,13 @@ class GomokuNetwork:
         # 더 드문 주기로 학습된 weight file 및 학습 데이터를 파일로 저장
         if self.iter_idx%self.save_frequency == 0:
             if self.saver_lock is not None:
-                print('[Write] Lock Saver')
+                # print('[Write] Lock Saver')
                 self.saver_lock.acquire()
             print('[%d] Writing model and replay buffers....'%self.iter_idx)
             self.saver.save(self.sess, self.network_path + 'model.ckpt', write_meta_graph=False)
             time.sleep(3)
             if self.saver_lock is not None:
-                print('[Write] UnLock Saver ')
+                # print('[Write] UnLock Saver ')
                 self.saver_lock.release()
             self.dump_training_data()
             print('Done.')
@@ -526,10 +534,10 @@ class GomokuNetwork:
         return self.iter_idx
 
 class NNMCTS:
-    def __init__(self, game_state, my_id, nn_path, nn_device, time_out=60.0, proc_num=-1, saver_lock=None, freeze_network=True):
+    def __init__(self, game_state, my_id, nn_path, nn_device, time_out=60.0, proc_num=-1, saver_lock=None, action_predictor=None):
         self.game_state = game_state.Clone()
         self.my_id = my_id
-        self.action_predictor = GomokuNetwork(nn_path, device='/cpu:0', saver_lock=saver_lock)
+        self.action_predictor = action_predictor
         self.root_node = Node(game_state=self.game_state, parent=None, action=None, action_predictor=self.action_predictor)
         self.time_out = time_out
         self.proc_num = 1
@@ -544,7 +552,7 @@ class NNMCTS:
         self.task_queue = Queue()
         self.result_queue = Queue()
         self.saver_lock = saver_lock
-        self.freeze_network = freeze_network
+        self.freeze_network = Value('i',1)
         self.StartProcess()
 
     def ResetGameState(self, game_state):
@@ -631,10 +639,6 @@ class NNMCTS:
         # # print('Action: %d'%action)
         # return action, 0
 
-        if self.freeze_network is False:
-            # Always use the latest network, if this is trainee
-            self.action_predictor.restore_network()
-
         start_time = time.time()
 
         expand_time = 0
@@ -720,8 +724,9 @@ def GetAction(prev_state, cur_state):
     o_action = o_action_index[0][0] * len(cur_state) + o_action_index[1][0]
     return x_action, o_action
 
-def TrainValueNetwork(network_path, device, replay_buffer, saver_lock, cur_win_rate):
-    train_network = GomokuNetwork(network_path=network_path, replay_buffer_size=5000, device=device, saver_lock=saver_lock, train_mode=True, lr=0.01)
+def TrainNetwork(network_path, device, replay_buffer, saver_lock, cur_win_rate):
+    train_network = GomokuNetwork(network_path=network_path, replay_buffer_size=10000, device=device, saver_lock=saver_lock,
+                                  train_mode=True, lr=0.01, owner_name='Trainer')
 
     print('Replay size = %d'%len(train_network.replay_buffer))
     while True:
@@ -751,12 +756,20 @@ def ProcSelfPlay(process_name, network_path, play_devices, time_out, board_size,
     init_game_board = [[0 for _ in range(board_size)] for _ in range(board_size)]
     init_game_state = GameState(init_game_board)
     game_state = init_game_state.Clone()
-    x_player_mcts = NNMCTS(game_state, 1, network_path, play_devices[0], time_out=time_out, proc_num=1, saver_lock=saver_lock, freeze_network=False)
-    o_player_mcts = NNMCTS(game_state, 2, network_path, play_devices[1], time_out=time_out, proc_num=1, saver_lock=saver_lock, freeze_network=False)
+    action_predictor = GomokuNetwork(network_path, device='/cpu:0', saver_lock=saver_lock, owner_name='SelfPlayActionPredictor')
+    x_player_mcts = NNMCTS(game_state, 1, network_path, play_devices[0], time_out=time_out, proc_num=1,
+                           saver_lock=saver_lock, action_predictor=action_predictor)
+    o_player_mcts = NNMCTS(game_state, 2, network_path, play_devices[1], time_out=time_out, proc_num=1,
+                           saver_lock=saver_lock, action_predictor=action_predictor)
     played_game = 0
     print('[%s]Start SelfPlay.'%process_name)
     result_list = deque(maxlen=100)
     while True:
+        # Restore to the recent network
+        x_player_mcts.freeze_network.value = 0
+        o_player_mcts.freeze_network.value = 0
+        print('[%s]Try to restore the latest model.' % process_name)
+        action_predictor.restore_network()
         board_state_list = []
         action_score_list = []
         game_state = init_game_state.Clone()
@@ -834,7 +847,9 @@ def ProcEvaluate(time_out, eval_game, saver_lock, eval_proc_state, cur_win_rate_
     best_nn_path =  working_directory + 'best_network_weight/'
     init_game_board = [[0 for _ in range(board_size)] for _ in range(board_size)]
     init_game_state = GameState(init_game_board)
-    decision_maker = NNMCTS(init_game_state, 1, nn_path, '/cpu:0', time_out=time_out, proc_num=1, freeze_network=False, saver_lock=saver_lock)
+    action_predictor = GomokuNetwork(nn_path, device='/cpu:0', saver_lock=saver_lock, owner_name='EvaluatorActionPredictor')
+    decision_maker = NNMCTS(init_game_state, 1, nn_path, '/cpu:0', time_out=time_out, proc_num=1,
+                            saver_lock=saver_lock, action_predictor=action_predictor)
     best_win_rate = 0
     eval_num = 0
     print('Start Evaluation Process.')
@@ -844,6 +859,9 @@ def ProcEvaluate(time_out, eval_game, saver_lock, eval_proc_state, cur_win_rate_
         game_state = init_game_state.Clone()
         decision_maker.ResetGameState(game_state)
         turn_num = 0
+        print('[Evaluator] Try to restore the latest model.')
+        decision_maker.action_predictor.restore_network()
+        decision_maker.freeze_network.value = 0
         while done is False:
             action, win_rate,_ = decision_maker.SearchBestActionMultiProc(print_info=False)
             observation, reward, done, info = env.step(action)
@@ -887,11 +905,11 @@ def SelfPlayTrain():
     replay_buffer = Queue()
 
     cur_win_rate = Value('d', 0)
-    # Start train process, 1 train process
-    train_process = Process(target=TrainValueNetwork, args=(network_path, train_device, replay_buffer, saver_lock, cur_win_rate,))
+    # # Start train process, 1 train process
+    train_process = Process(target=TrainNetwork, args=(network_path, train_device, replay_buffer, saver_lock, cur_win_rate,))
     train_process.start()
-
-    # Start Self-play process, at least 4 processes will run
+    #
+    # # Start Self-play process, at least 4 processes will run
     selfplay_state = [Value('i',0), Value('i',0)]
     selfplay_process1 = Process(target=ProcSelfPlay, args=('Proc1', network_path, play_devices, train_time_out, board_size, replay_buffer, saver_lock, selfplay_state[0],))
     selfplay_process1.start()
@@ -919,7 +937,8 @@ def play_mcts_gomoku():
     game_state = GameState(init_game_board)
     # print('%d CPU available'%multiprocessing.cpu_count())
     nn_path = working_directory + 'network_weight/'
-    decision_maker = NNMCTS(game_state, 1, nn_path, '/gpu:0', time_out=60, proc_num=1)
+    action_predictor = GomokuNetwork(nn_path, device='/cpu:0')
+    decision_maker = NNMCTS(game_state, 1, nn_path, '/gpu:0', time_out=60, proc_num=1, action_predictor=action_predictor)
     print('Start')
     while done is False:
         # action, win_rate = decision_maker.SearchBestAction()
