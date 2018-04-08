@@ -127,8 +127,8 @@ class Node:
 
     def GetScore(self):
         if self.visit > 0:
-            return self.visit
-            # return self.value / self.visit
+            # return self.visit
+            return self.value / self.visit
         else:
             return 0.0
 
