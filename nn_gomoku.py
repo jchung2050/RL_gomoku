@@ -15,7 +15,7 @@ import _pickle as pickle
 import gzip
 from time import localtime, strftime
 
-working_directory = 'd:/temp/'
+working_directory = './temp/'
 
 def TestStateNodeReceive(in_queue: Queue):
     game_state, node = in_queue.get()
@@ -534,10 +534,10 @@ class GomokuNetwork:
         return self.iter_idx
 
 class NNMCTS:
-    def __init__(self, game_state, my_id, nn_path, nn_device, time_out=60.0, proc_num=-1, saver_lock=None, action_predictor=None):
+    def __init__(self, game_state, my_id, nn_path, nn_device, time_out=60.0, proc_num=-1, saver_lock=None):
         self.game_state = game_state.Clone()
         self.my_id = my_id
-        self.action_predictor = action_predictor
+        self.action_predictor = GomokuNetwork(nn_path, device=nn_device, saver_lock=saver_lock)
         self.root_node = Node(game_state=self.game_state, parent=None, action=None, action_predictor=self.action_predictor)
         self.time_out = time_out
         self.proc_num = 1
@@ -756,20 +756,19 @@ def ProcSelfPlay(process_name, network_path, play_devices, time_out, board_size,
     init_game_board = [[0 for _ in range(board_size)] for _ in range(board_size)]
     init_game_state = GameState(init_game_board)
     game_state = init_game_state.Clone()
-    action_predictor = GomokuNetwork(network_path, device='/cpu:0', saver_lock=saver_lock, owner_name='SelfPlayActionPredictor')
     x_player_mcts = NNMCTS(game_state, 1, network_path, play_devices[0], time_out=time_out, proc_num=1,
-                           saver_lock=saver_lock, action_predictor=action_predictor)
+                           saver_lock=saver_lock)
     o_player_mcts = NNMCTS(game_state, 2, network_path, play_devices[1], time_out=time_out, proc_num=1,
-                           saver_lock=saver_lock, action_predictor=action_predictor)
+                           saver_lock=saver_lock)
     played_game = 0
     print('[%s]Start SelfPlay.'%process_name)
     result_list = deque(maxlen=100)
     while True:
         # Restore to the recent network
         x_player_mcts.freeze_network.value = 0
-        o_player_mcts.freeze_network.value = 0
+        # o_player_mcts.freeze_network.value = 0
         print('[%s]Try to restore the latest model.' % process_name)
-        action_predictor.restore_network()
+        x_player_mcts.action_predictor.restore_network()
         board_state_list = []
         action_score_list = []
         game_state = init_game_state.Clone()
@@ -847,9 +846,8 @@ def ProcEvaluate(time_out, eval_game, saver_lock, eval_proc_state, cur_win_rate_
     best_nn_path =  working_directory + 'best_network_weight/'
     init_game_board = [[0 for _ in range(board_size)] for _ in range(board_size)]
     init_game_state = GameState(init_game_board)
-    action_predictor = GomokuNetwork(nn_path, device='/cpu:0', saver_lock=saver_lock, owner_name='EvaluatorActionPredictor')
     decision_maker = NNMCTS(init_game_state, 1, nn_path, '/cpu:0', time_out=time_out, proc_num=1,
-                            saver_lock=saver_lock, action_predictor=action_predictor)
+                            saver_lock=saver_lock)
     best_win_rate = 0
     eval_num = 0
     print('Start Evaluation Process.')
@@ -895,7 +893,7 @@ def ProcEvaluate(time_out, eval_game, saver_lock, eval_proc_state, cur_win_rate_
 
 def SelfPlayTrain():
     network_path = working_directory + 'network_weight/'
-    train_device = '/gpu:0'
+    train_device = '/cpu:0'
     play_devices = ['/cpu:0','/cpu:0']
     board_size = 9
     train_time_out = 5
@@ -913,9 +911,9 @@ def SelfPlayTrain():
     selfplay_state = [Value('i',0), Value('i',0)]
     selfplay_process1 = Process(target=ProcSelfPlay, args=('Proc1', network_path, play_devices, train_time_out, board_size, replay_buffer, saver_lock, selfplay_state[0],))
     selfplay_process1.start()
-    selfplay_process2 = Process(target=ProcSelfPlay, args=(
-    'Proc2', network_path, play_devices, train_time_out, board_size, replay_buffer, saver_lock, selfplay_state[1],))
-    selfplay_process2.start()
+    # selfplay_process2 = Process(target=ProcSelfPlay, args=(
+    # 'Proc2', network_path, play_devices, train_time_out, board_size, replay_buffer, saver_lock, selfplay_state[1],))
+    # selfplay_process2.start()
 
     # Start Evaluation process, 2 processes will run
     eval_proc_state = Value('i', 0)
@@ -937,8 +935,7 @@ def play_mcts_gomoku():
     game_state = GameState(init_game_board)
     # print('%d CPU available'%multiprocessing.cpu_count())
     nn_path = working_directory + 'network_weight/'
-    action_predictor = GomokuNetwork(nn_path, device='/cpu:0')
-    decision_maker = NNMCTS(game_state, 1, nn_path, '/gpu:0', time_out=60, proc_num=1, action_predictor=action_predictor)
+    decision_maker = NNMCTS(game_state, 1, nn_path, '/cpu:0', time_out=60, proc_num=1)
     print('Start')
     while done is False:
         # action, win_rate = decision_maker.SearchBestAction()

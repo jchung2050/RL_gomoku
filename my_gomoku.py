@@ -402,7 +402,7 @@ def play_mcts_gomoku():
     init_game_board = [[0 for _ in range(board_size)] for _ in range(board_size)]
     game_state = GameState(init_game_board)
     # print('%d CPU available'%multiprocessing.cpu_count())
-    decision_maker = MCTS(game_state, 1, time_out=60, proc_num = -1)
+    decision_maker = MCTS(game_state, 1, time_out=20, proc_num = -1)
     print('Start')
     while done is False:
         # action, win_rate = decision_maker.SearchBestAction()
